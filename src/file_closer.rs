@@ -1,7 +1,6 @@
 //use std::sync::Arc;
 
 use std::{
-	convert::identity,
 	fs::File,
 	sync::{
 		mpsc::{self, Sender},

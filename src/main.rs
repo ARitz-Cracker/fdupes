@@ -1,5 +1,6 @@
 use std::{
-	io::Write,
+	fs::OpenOptions,
+	io::{Seek, Write},
 	path::{Path, PathBuf},
 	sync::{Arc, LazyLock},
 };
@@ -132,10 +133,13 @@ pub fn space_seperation<'a>(mut input: &'a str) -> Vec<String> {
 #[derive(Debug, Clone, Bpaf)]
 #[bpaf(options, version(VERSION_INFO))]
 pub struct InvokeArgs {
-	// Number of threads to use during indexing. Defaults to the number of CPU threads the system reports.
+	/// Number of threads to use during indexing. Defaults to the number of CPU threads the system reports.
 	#[bpaf(argument("COUNT"), short, long, fallback(num_cpus::get()))]
 	jobs: usize,
-	// Paths to traverse
+	/// Save the hash index
+	#[bpaf(argument("FILE"), short, long)]
+	index: PathBuf,
+	/// Paths to traverse
 	#[bpaf(positional("PATH"))]
 	path: Vec<PathBuf>,
 }
@@ -152,6 +156,8 @@ pub enum Commands {
 		#[bpaf(short, long)]
 		argument: String,
 	},
+	#[bpaf(command)]
+	SaveIndex,
 	#[bpaf(command)]
 	Ls {
 		#[bpaf(short, long)]
@@ -170,19 +176,19 @@ pub enum Commands {
 		dir: PathBuf,
 	},
 	#[bpaf(command)]
-	// Removes all empty directories within....
+	/// Removes all empty directories within....
 	Rmedir {
 		#[bpaf(positional("DIR"))]
 		dir: PathBuf,
 	},
 	#[bpaf(command)]
-	// Removes files from all other folders which are duplicates of any files within this folder
+	/// Removes files from all other folders which are duplicates of any files within this folder
 	Rmodupes {
 		#[bpaf(positional("DIR"))]
 		dir: PathBuf,
 	},
 	#[bpaf(command)]
-	// Removes all duplicates within the specified folder, keeping the one with the shortest path
+	/// Removes all duplicates within the specified folder, keeping the one with the shortest path
 	Rmdupes {
 		#[bpaf(positional("DIR"))]
 		dir: PathBuf,
@@ -195,34 +201,46 @@ pub enum Commands {
 	Quit,
 }
 
-static THREADS: LazyLock<usize> = LazyLock::new(|| invoke_args().run().jobs);
-static PATHS: LazyLock<Vec<PathBuf>> = LazyLock::new(|| invoke_args().run().path);
+static CLI_ARGS: LazyLock<InvokeArgs> = LazyLock::new(|| invoke_args().run());
+// There's some quick and dirty stuff, this all used to be based around Path and PathBuf,
+// But those types don't have borsh serialization, so now it's all str and String... should be fine
 fn main() -> anyhow::Result<()> {
-	if PATHS.is_empty() {
+	if CLI_ARGS.path.is_empty() {
 		anyhow::bail!("Needs at least one path")
 	}
-	println!("Creating index with {} threads...", *THREADS);
+	println!("Creating index with {} threads...", CLI_ARGS.jobs);
 	let mut index = FileIndex::default();
-	let mut virtual_root_contents: Vec<Arc<Path>> = Vec::new();
-	for path in PATHS.iter() {
-		let path = path.canonicalize()?;
-		index.extend(FileIndex::from_folder(path.as_path().into())?);
-		virtual_root_contents.push(path.as_path().into());
+	let mut index_file = (&*OpenOptions::new().read(true).write(true).create(true)).open(&CLI_ARGS.index)?;
+	if index_file.metadata()?.len() == 0 {
+		let mut virtual_root_contents: Vec<Arc<str>> = Vec::new();
+		for path in CLI_ARGS.path.iter() {
+			let path = path.canonicalize()?;
+			index.extend(FileIndex::from_folder(path.to_string_lossy().into())?);
+			virtual_root_contents.push(path.to_string_lossy().into());
+		}
+		index.paths_to_items.insert(
+			":root".into(),
+			FileIndexItem::Folder {
+				contents: virtual_root_contents,
+			},
+		);
+		println!("Writing index file...");
+		index_file.rewind()?;
+		borsh::to_writer(&mut index_file, &index)?;
+		println!("Saving file...");
+		index_file.flush()?;
+	} else {
+		index = borsh::de::from_reader(&mut index_file)?;
 	}
 	stop_file_closer_thread();
-	index.paths_to_items.insert(
-		PathBuf::from(":root").as_path().into(),
-		FileIndexItem::Folder {
-			contents: virtual_root_contents,
-		},
-	);
 
 	let mut cwd = PathBuf::from(":root");
 	let mut input = String::new();
 	loop {
 		input.clear();
 		let cwd_as_path: Arc<Path> = cwd.as_path().into();
-		if !index.paths_to_items.contains_key(&cwd_as_path) {
+		let cwd_as_str = cwd_as_path.to_string_lossy();
+		if !index.paths_to_items.contains_key(&*cwd_as_path.to_string_lossy()) {
 			println!("Going back to :root cuz the requested folder hasn't been explored.");
 			cwd = PathBuf::from(":root");
 			continue;
@@ -247,8 +265,8 @@ fn main() -> anyhow::Result<()> {
 				},
 				Commands::Ls { duplicates, recursive } => {
 					if recursive {
-						for (file_path, file_item) in index.paths_to_items.iter() {
-							let file_path_str = file_path.to_string_lossy();
+						for (file_path_str, file_item) in index.paths_to_items.iter() {
+							//let file_path_str = file_path.to_string_lossy();
 							match file_item {
 								FileIndexItem::File { hash } => {
 									let dupe_count = index.file_instance_count(hash);
@@ -264,12 +282,14 @@ fn main() -> anyhow::Result<()> {
 							}
 						}
 					} else {
-						match index.paths_to_items.get(&cwd_as_path) {
+						match index.paths_to_items.get(&*cwd_as_str) {
 							Some(FileIndexItem::Folder { contents }) => {
-								for file_path in contents.iter() {
-									let Some(file_item) = index.paths_to_items.get(file_path) else {
+								for file_path_str in contents.iter() {
+									let file_path = Path::new(file_path_str.as_ref());
+									let Some(file_item) = index.paths_to_items.get(file_path_str) else {
 										continue;
 									};
+
 									let file_path_str = if cwd.to_string_lossy() == ":root" {
 										file_path.to_string_lossy()
 									} else {
@@ -298,16 +318,17 @@ fn main() -> anyhow::Result<()> {
 				},
 				Commands::Info { file } => {
 					let full_path: Arc<Path> = cwd.join(&file).as_path().into();
-					match index.paths_to_items.get(&full_path) {
+					let full_path_str = &*full_path.to_string_lossy();
+					match index.paths_to_items.get(full_path_str) {
 						Some(item) => {
 							println!("# Information about {}:", full_path.to_string_lossy());
 							match item {
 								FileIndexItem::File { hash } => {
 									let mut dupes = index.hash_to_paths.get(hash).cloned().unwrap_or_default();
-									dupes.remove(&full_path);
+									dupes.remove(full_path_str);
 									println!("File with {} duplicates", dupes.len());
 									for dupe in dupes {
-										println!(" -  {}", dupe.to_string_lossy());
+										println!(" -  {}", dupe);
 									}
 								},
 								FileIndexItem::Folder { contents } => {
@@ -329,7 +350,11 @@ fn main() -> anyhow::Result<()> {
 						cwd.pop();
 					} else {
 						let new_dir = cwd.join(dir);
-						if index.paths_to_items.get(new_dir.as_path().into()).is_some() {
+						if index
+							.paths_to_items
+							.get(&*new_dir.as_path().to_string_lossy())
+							.is_some()
+						{
 							cwd = new_dir;
 						} else {
 							println!("{}: No such file or directory", new_dir.to_string_lossy())
@@ -374,6 +399,13 @@ fn main() -> anyhow::Result<()> {
 						continue;
 					}
 					index.remove_dupes_from_folder(&new_dir)?;
+				},
+				Commands::SaveIndex => {
+					println!("Writing index file...");
+					index_file.rewind()?;
+					borsh::to_writer(&mut index_file, &index)?;
+					println!("Saving file...");
+					index_file.flush()?;
 				},
 			},
 			Err(err) => match err {

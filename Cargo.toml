@@ -1,6 +1,6 @@
 [package]
 name = "fdupes"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -9,6 +9,7 @@ anyhow = "1.0.92"
 const_format = "0.2.33"
 sha2 = "0.10"
 num_cpus = "1.16.0"
+borsh = { version = "1.5.5", features = ["derive", "rc"] }
 
 [build-dependencies]
 rustc_version = "0.4.1"

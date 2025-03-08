@@ -7,12 +7,13 @@ use std::{
 	sync::Arc,
 };
 
+use borsh::{BorshDeserialize, BorshSerialize};
 use sha2::Digest;
 
 use crate::{
-	deep_readdir::DeepReadDir, file_closer::deferred_file_drop, multi_thread_iter::multi_thread_map_iter, THREADS,
+	deep_readdir::DeepReadDir, file_closer::deferred_file_drop, multi_thread_iter::multi_thread_map_iter, CLI_ARGS,
 };
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, BorshDeserialize, BorshSerialize)]
 pub struct FileHash {
 	pub file_len: u64,
 	pub digest_256: [u8; 32],
@@ -47,11 +48,12 @@ impl FileHash {
 	}
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
 pub enum FileIndexItem {
 	File { hash: FileHash },
-	Folder { contents: Vec<Arc<Path>> },
+	Folder { contents: Vec<Arc<str>> },
 }
+
 impl FileIndexItem {
 	pub fn as_file(&self) -> Option<&FileHash> {
 		match self {
@@ -59,7 +61,7 @@ impl FileIndexItem {
 			_ => None,
 		}
 	}
-	pub fn as_folder(&self) -> Option<&[Arc<Path>]> {
+	pub fn as_folder(&self) -> Option<&[Arc<str>]> {
 		match self {
 			Self::Folder { contents } => Some(&contents),
 			_ => None,
@@ -67,10 +69,10 @@ impl FileIndexItem {
 	}
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, BorshDeserialize, BorshSerialize)]
 pub struct FileIndex {
-	pub hash_to_paths: BTreeMap<FileHash, BTreeSet<Arc<Path>>>,
-	pub paths_to_items: BTreeMap<Arc<Path>, FileIndexItem>,
+	pub hash_to_paths: BTreeMap<FileHash, BTreeSet<Arc<str>>>,
+	pub paths_to_items: BTreeMap<Arc<str>, FileIndexItem>,
 }
 
 impl FileIndex {
@@ -82,9 +84,10 @@ impl FileIndex {
 			.into_iter()
 			.rev()
 			.filter_map(|(path, file_index_item)| -> Option<anyhow::Result<_>> {
-				if path.starts_with(starting_with) && file_index_item.as_folder().is_some_and(<[_]>::is_empty) {
-					println!("deleting: {}", path.to_string_lossy());
-					match fs::remove_dir(path) {
+				let path_path = Path::new(&*path);
+				if path_path.starts_with(starting_with) && file_index_item.as_folder().is_some_and(<[_]>::is_empty) {
+					println!("deleting: {}", path);
+					match fs::remove_dir(path_path) {
 						Ok(_) => None,
 						Err(err) => Some(Err(err.into())),
 					}
@@ -99,12 +102,13 @@ impl FileIndex {
 		for (_, paths) in self
 			.hash_to_paths
 			.iter_mut()
-			.filter(|(_, paths)| paths.len() > 1 && paths.iter().any(|path| path.starts_with(except)))
+			.filter(|(_, paths)| paths.len() > 1 && paths.iter().any(|path| Path::new(&**path).starts_with(except)))
 		{
 			for path in paths.clone() {
-				if !path.starts_with(except) {
-					println!("deleting: {}", path.to_string_lossy());
-					fs::remove_file(&path)?;
+				let path_path = Path::new(&*path);
+				if !path_path.starts_with(except) {
+					println!("deleting: {}", path);
+					fs::remove_file(path_path)?;
 					paths.remove(&path);
 					self.paths_to_items.remove(&path);
 				}
@@ -116,35 +120,40 @@ impl FileIndex {
 		for (_, paths) in self.hash_to_paths.iter_mut() {
 			let mut paths_to_remove = paths
 				.iter()
-				.filter(|path| path.starts_with(folder) && paths.len() > 1)
+				.filter(|path| Path::new(&***path).starts_with(folder) && paths.len() > 1)
 				.cloned()
 				.collect::<Vec<_>>();
 
 			if paths_to_remove.is_empty() {
 				continue;
 			}
-			paths_to_remove.sort_by(|path_a, path_b| path_a.components().count().cmp(&path_b.components().count()));
+			paths_to_remove.sort_by(|path_a, path_b| {
+				Path::new(&**path_a)
+					.components()
+					.count()
+					.cmp(&Path::new(&**path_b).components().count())
+			});
 			paths_to_remove.remove(1); // Keep one with shortest path
 			while let Some(path_to_remove) = paths_to_remove.pop() {
-				println!("deleting: {}", path_to_remove.to_string_lossy());
-				fs::remove_file(&path_to_remove)?;
+				println!("deleting: {}", path_to_remove);
+				fs::remove_file(&*path_to_remove)?;
 				paths.remove(&path_to_remove);
 				self.paths_to_items.remove(&path_to_remove);
 			}
 		}
 		Ok(())
 	}
-	pub fn from_folder(folder_path: Arc<Path>) -> anyhow::Result<Self> {
-		let mut hash_to_paths: BTreeMap<FileHash, BTreeSet<Arc<Path>>> = BTreeMap::new();
-		let mut paths_to_items: BTreeMap<Arc<Path>, FileIndexItem> = BTreeMap::new();
-		println!("exploring: {}", folder_path.to_string_lossy());
+	pub fn from_folder(folder_path: Arc<str>) -> anyhow::Result<Self> {
+		let mut hash_to_paths: BTreeMap<FileHash, BTreeSet<Arc<str>>> = BTreeMap::new();
+		let mut paths_to_items: BTreeMap<Arc<str>, FileIndexItem> = BTreeMap::new();
+		println!("exploring: {}", folder_path);
 
 		let mut top_level_contents = Vec::new();
-		for inner_dir_entry in read_dir(&folder_path)? {
+		for inner_dir_entry in read_dir(&*folder_path)? {
 			let inner_dir_entry = inner_dir_entry?;
 			let inner_file_type = inner_dir_entry.file_type()?;
 			if inner_file_type.is_dir() || inner_file_type.is_file() {
-				top_level_contents.push(Arc::from(inner_dir_entry.path()));
+				top_level_contents.push(Arc::from(inner_dir_entry.path().to_string_lossy()));
 			}
 		}
 		top_level_contents.sort();
@@ -156,46 +165,50 @@ impl FileIndex {
 		);
 
 		for iter_result in multi_thread_map_iter(
-			DeepReadDir::new(&folder_path)?.filter_map(|dir_entry| -> Option<anyhow::Result<(DirEntry, FileType)>> {
-				match dir_entry {
-					Ok(dir_entry) => match dir_entry.file_type() {
-						Ok(file_type) if file_type.is_dir() || file_type.is_file() => Some(Ok((dir_entry, file_type))),
-						Ok(_) => {
-							eprintln!("{}: ignoring special/system file", dir_entry.path().to_string_lossy());
-							None
+			DeepReadDir::new(Path::new(folder_path.as_ref()))?.filter_map(
+				|dir_entry| -> Option<anyhow::Result<(DirEntry, FileType)>> {
+					match dir_entry {
+						Ok(dir_entry) => match dir_entry.file_type() {
+							Ok(file_type) if file_type.is_dir() || file_type.is_file() => {
+								Some(Ok((dir_entry, file_type)))
+							},
+							Ok(_) => {
+								eprintln!("{}: ignoring special/system file", dir_entry.path().to_string_lossy());
+								None
+							},
+							Err(err) => Some(Err(err.into())),
 						},
 						Err(err) => Some(Err(err.into())),
-					},
-					Err(err) => Some(Err(err.into())),
-				}
-			}),
-			|dir_entry| -> anyhow::Result<(Arc<Path>, FileIndexItem)> {
+					}
+				},
+			),
+			|dir_entry| -> anyhow::Result<(Arc<str>, FileIndexItem)> {
 				let (dir_entry, file_type) = dir_entry?;
-				let file_path: Arc<Path> = Arc::from(dir_entry.path().as_path());
-				let file_path_str = file_path.to_string_lossy();
+				let file_path: Arc<str> = Arc::from(dir_entry.path().to_string_lossy());
+				// let file_path_str = file_path.to_string_lossy();
 				if file_type.is_dir() {
-					println!("indexing: {file_path_str}");
+					println!("indexing: {file_path}");
 					let mut contents = Vec::new();
 					// Yeah, some folders are going to get read twice, whatever.
-					for inner_dir_entry in read_dir(&file_path)? {
+					for inner_dir_entry in read_dir(&*file_path)? {
 						let inner_dir_entry = inner_dir_entry?;
 						let inner_file_type = inner_dir_entry.file_type()?;
 						if inner_file_type.is_dir() || inner_file_type.is_file() {
-							contents.push(Arc::from(inner_dir_entry.path()));
+							contents.push(Arc::from(inner_dir_entry.path().to_string_lossy()));
 						}
 					}
 					contents.sort();
 					return Ok((file_path, FileIndexItem::Folder { contents }));
 				} else if file_type.is_file() {
-					println!("hashing: {file_path_str}");
-					let hash = FileHash::from_file(File::open(&file_path)?)?;
-					println!("hashed: {file_path_str}");
+					println!("hashing: {file_path}");
+					let hash = FileHash::from_file(File::open(&*file_path)?)?;
+					println!("hashed: {file_path}");
 					return Ok((file_path, FileIndexItem::File { hash }));
 				} else {
 					unreachable!("dir entry should have already been filtered")
 				}
 			},
-			*THREADS,
+			CLI_ARGS.jobs,
 		) {
 			let (path, index_item) = iter_result?;
 			match &index_item {
