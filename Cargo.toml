@@ -2,6 +2,8 @@
 name = "fdupes"
 version = "0.1.1"
 edition = "2021"
+description = "a tool to help find and delete duplicate files"
+license = "MIT"
 
 [dependencies]
 bpaf = { version = "0.9.15", features = ["derive"] }
